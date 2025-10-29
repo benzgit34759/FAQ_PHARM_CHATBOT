@@ -1,0 +1,586 @@
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI RAG ผู้เชี่ยวชาญกฎระเบียบ (Offline)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 1. นำเข้า PDF.js สำหรับการดึงข้อความจาก PDF ในเบราว์เซอร์ -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; background-color: #f7fafc; }
+        .card { background-color: white; border-radius: 0.75rem; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05); }
+        .btn-primary { background-color: #4f46e5; color: white; padding: 0.5rem 1rem; border-radius: 0.5rem; transition: background-color 0.2s; }
+        .btn-primary:hover { background-color: #4338ca; }
+        .btn-danger { background-color: #ef4444; color: white; padding: 0.5rem 1rem; border-radius: 0.5rem; transition: background-color 0.2s; }
+        .btn-danger:hover { background-color: #dc2626; }
+        .btn-secondary { background-color: #e5e7eb; color: #1f2937; padding: 0.5rem 1rem; border-radius: 0.5rem; transition: background-color 0.2s; }
+        .btn-secondary:hover { background-color: #d1d5db; }
+        .chat-bubble { max-width: 80%; padding: 0.75rem 1rem; border-radius: 1rem; margin-bottom: 0.5rem; }
+        .user-bubble { background-color: #3b82f6; color: white; margin-left: auto; border-bottom-right-radius: 0.25rem; }
+        .ai-bubble { background-color: #e5e7eb; color: #1f2937; margin-right: auto; border-bottom-left-radius: 0.25rem; }
+        .error-box { background-color: #fef2f2; border: 1px solid #f87171; color: #dc2626; padding: 0.75rem; border-radius: 0.5rem; margin-top: 1rem; }
+        .success-box { background-color: #ecfdf5; border: 1px solid #10b981; color: #059669; padding: 0.75rem; border-radius: 0.5rem; margin-top: 1rem; }
+        
+        /* สไตล์สำหรับการซ่อน/แสดงหน้า */
+        .page-section { display: none; }
+    </style>
+    <script>
+        // *** GLOBAL UTILITIES (Local Storage, ID Generation, and Data Management) ***
+        const STORAGE_KEY = 'pharmacy_regulations_v1';
+        
+        // ฟังก์ชันสำหรับโหลดข้อมูลทั้งหมดจาก Local Storage
+        const loadDocuments = () => {
+            try {
+                const data = localStorage.getItem(STORAGE_KEY);
+                return data ? JSON.parse(data) : [];
+            } catch (error) {
+                console.error("Error loading data from Local Storage:", error);
+                return [];
+            }
+        };
+
+        // ฟังก์ชันสำหรับบันทึกข้อมูลทั้งหมดลง Local Storage (เพิ่มการตรวจสอบการเขียน)
+        const saveDocuments = (docs) => {
+            try {
+                const jsonStr = JSON.stringify(docs);
+                localStorage.setItem(STORAGE_KEY, jsonStr);
+                
+                // ตรวจสอบการเขียนข้อมูล: ลองอ่านข้อมูลกลับมาทันที
+                const checkStr = localStorage.getItem(STORAGE_KEY);
+                if (checkStr === jsonStr) {
+                    console.log("Local Storage: Data saved and verified.");
+                    return true;
+                } else {
+                    throw new Error("Local Storage write verification failed.");
+                }
+            } catch (error) {
+                console.error("CRITICAL ERROR: Error saving data to Local Storage:", error);
+                const saveMessageEl = document.getElementById('saveMessage');
+                if (saveMessageEl) {
+                    saveMessageEl.className = 'error-box';
+                    saveMessageEl.textContent = `[ข้อผิดพลาดถาวร] บันทึกข้อมูลล้มเหลว: ${error.message} (พื้นที่เต็ม?)`;
+                }
+                return false;
+            }
+        };
+
+        // ฟังก์ชันสำหรับสร้าง ID ที่ไม่ซ้ำ
+        const generateId = () => Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+
+        // ฟังก์ชันสำหรับแปลงตัวเลขไบต์ให้เป็นรูปแบบอ่านง่าย
+        const formatBytes = (bytes) => {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        };
+
+        // ฟังก์ชันสำหรับสร้างบริบทจากเอกสารทั้งหมด (จำลอง RAG)
+        const buildContext = (allDocs) => {
+            let combinedText = '';
+            const titles = [];
+
+            // 1. รวมข้อความจากทุก chunk
+            allDocs.forEach(doc => {
+                combinedText += `\n\n--- [เอกสาร: ${doc.title} (ID: ${doc.id})] ---\n${doc.content}`;
+                if (!titles.includes(doc.title)) {
+                    titles.push(doc.title);
+                }
+            });
+
+            // 2. จำกัดขนาดบริบทไม่ให้เกิน 128,000 ตัวอักษร (Gemini 2.5 Flash context limit)
+            const MAX_CONTEXT_LENGTH = 120000;
+            if (combinedText.length > MAX_CONTEXT_LENGTH) {
+                combinedText = combinedText.substring(combinedText.length - MAX_CONTEXT_LENGTH);
+                console.warn(`Context trimmed to ${MAX_CONTEXT_LENGTH} characters.`);
+            }
+
+            return { combinedText, titles };
+        };
+        
+        // *** APPLICATION STATE AND DOM MANIPULATION ***
+        
+        let allDocuments = []; // ตัวแปรเก็บสถานะเอกสารปัจจุบัน
+
+        const setUIState = () => {
+            const newDocTitleEl = document.getElementById('newDocTitle');
+            const newDocContentEl = document.getElementById('newDocContent');
+            const saveBtn = document.getElementById('saveDocumentBtn');
+
+            const isTitleValid = newDocTitleEl.value.trim().length > 0;
+            const isContentValid = newDocContentEl.value.trim().length > 10;
+            
+            // ปุ่มบันทึกจะเปิดใช้งานเมื่อมีชื่อและเนื้อหา
+            saveBtn.disabled = !(isTitleValid && isContentValid);
+        };
+
+        const renderDocList = () => {
+            const docListContainer = document.getElementById('docListContainer');
+            if (!docListContainer) return; // ป้องกันข้อผิดพลาดเมื่ออยู่หน้า User
+            
+            docListContainer.innerHTML = '';
+            
+            const docCountEl = document.getElementById('docCount');
+            docCountEl.textContent = allDocuments.length;
+            
+            // ปุ่มลบทั้งหมดจะเปิดใช้งานเมื่อมีเอกสารอย่างน้อย 1 ชิ้น
+            document.getElementById('deleteAllBtn').disabled = allDocuments.length === 0;
+
+            if (allDocuments.length === 0) {
+                docListContainer.innerHTML = '<p class="text-gray-500 italic p-4">ไม่พบเอกสารกฎระเบียบที่บันทึกไว้</p>';
+                return;
+            }
+
+            allDocuments.forEach(doc => {
+                const docEl = document.createElement('div');
+                docEl.className = 'flex justify-between items-center p-3 border-b border-gray-100 last:border-b-0 bg-white hover:bg-gray-50 transition-colors';
+                
+                // คำนวณขนาดข้อความที่ถูกใช้
+                const contentSize = doc.content ? doc.content.length : 0;
+                
+                docEl.innerHTML = `
+                    <div class="flex-1 min-w-0">
+                        <p class="font-semibold text-gray-800 truncate">${doc.title} <span class="text-sm text-gray-500 italic">(${doc.id.substring(0, 8)})</span></p>
+                        <p class="text-xs text-gray-500">
+                            ขนาด: ${formatBytes(contentSize)} 
+                            <span class="ml-2">|</span> 
+                            บันทึกเมื่อ: ${new Date(doc.timestamp).toLocaleDateString('th-TH')}
+                        </p>
+                    </div>
+                    <button 
+                        class="text-sm btn-danger px-3 py-1 ml-4"
+                        onclick="deleteDocument('${doc.id}', '${doc.title.replace(/'/g, "\\'")}')"
+                    >
+                        > ลบ
+                    </button>
+                `;
+                docListContainer.appendChild(docEl);
+            });
+        };
+
+        // *** CORE FUNCTIONS (SAVE/DELETE) ***
+
+        // ฟังก์ชันลบเอกสาร
+        const deleteDocument = (docId, title) => {
+            const saveMessageEl = document.getElementById('saveMessage');
+            
+            try {
+                const newDocs = allDocuments.filter(doc => doc.id !== docId);
+                
+                if (newDocs.length === allDocuments.length) {
+                    saveMessageEl.className = 'error-box';
+                    saveMessageEl.textContent = `[ERROR] ไม่พบเอกสาร ID: ${docId} ใน Local Storage`;
+                    return;
+                }
+                
+                allDocuments = newDocs;
+                if(saveDocuments(allDocuments)) { // ตรวจสอบการบันทึก
+                    renderDocList();
+                    saveMessageEl.className = 'success-box';
+                    saveMessageEl.textContent = `ลบเอกสาร "${title}" สำเร็จแล้ว`;
+                }
+            } catch (error) {
+                console.error("Local Storage Delete Error:", error);
+                if (saveMessageEl) {
+                    saveMessageEl.className = 'error-box';
+                    saveMessageEl.textContent = `[CRITICAL ERROR] การลบล้มเหลว: ${error.message}. โปรดตรวจสอบ Console (F12)`;
+                }
+            }
+        };
+
+        // ฟังก์ชันลบเอกสารทั้งหมด
+        const deleteAllDocuments = () => {
+             // ใช้ confirm() เพราะเป็นการกระทำที่อันตรายมาก
+            if (confirm("คุณแน่ใจหรือไม่ว่าต้องการลบเอกสารทั้งหมดในฐานความรู้?")) {
+                allDocuments = [];
+                if(saveDocuments(allDocuments)) { // ตรวจสอบการบันทึก
+                    renderDocList();
+                    const saveMessageEl = document.getElementById('saveMessage');
+                    saveMessageEl.className = 'success-box';
+                    saveMessageEl.textContent = 'ลบเอกสารทั้งหมดออกจากฐานความรู้สำเร็จแล้ว';
+                }
+            }
+        };
+
+        const handleSaveDocument = () => {
+            const newDocTitleEl = document.getElementById('newDocTitle');
+            const newDocContentEl = document.getElementById('newDocContent');
+            const saveMessageEl = document.getElementById('saveMessage');
+            
+            const title = newDocTitleEl.value.trim();
+            const content = newDocContentEl.value.trim();
+
+            if (!title || content.length < 10) {
+                saveMessageEl.className = 'error-box';
+                saveMessageEl.textContent = 'กรุณาใส่ชื่อเอกสารและข้อความที่มีความยาวอย่างน้อย 10 ตัวอักษร';
+                return;
+            }
+
+            // สร้างเอกสารใหม่
+            const newDoc = {
+                id: generateId(),
+                title: title,
+                content: content,
+                timestamp: Date.now(),
+                contentSize: content.length,
+            };
+
+            allDocuments.push(newDoc);
+            
+            // **ส่วนที่สำคัญ: ตรวจสอบการบันทึก**
+            if (saveDocuments(allDocuments)) {
+                renderDocList(); // อัปเดต UI
+                
+                // Clear input fields and reset UI state
+                newDocTitleEl.value = '';
+                newDocContentEl.value = '';
+                saveMessageEl.className = 'success-box';
+                saveMessageEl.textContent = `บันทึกเอกสาร "${title}" ลง Local Storage สำเร็จแล้ว`;
+                setUIState(); // ปิดใช้งานปุ่มบันทึก
+            }
+            // ถ้า saveDocuments คืนค่า false (บันทึกล้มเหลว) จะมีข้อความ Error ขึ้นแล้ว
+        };
+
+        // *** PDF PREVIEW FUNCTION ***
+        const previewPdfText = (event) => {
+            const files = event.target.files;
+            if (files.length === 0) return;
+
+            const file = files[0]; // เราจะประมวลผลไฟล์เดียว (แม้ว่า input จะเป็น multiple)
+            const newDocTitleEl = document.getElementById('newDocTitle');
+            const newDocContentEl = document.getElementById('newDocContent');
+            const saveMessageEl = document.getElementById('saveMessage');
+
+            newDocTitleEl.value = file.name; // ใช้ชื่อไฟล์เป็นชื่อเอกสาร
+            newDocContentEl.value = 'กำลังดึงข้อความจากไฟล์ PDF... โปรดรอสักครู่';
+            setUIState(); // ปิดใช้งานปุ่มชั่วคราว
+
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+                try {
+                    const pdfData = new Uint8Array(e.target.result);
+                    const pdf = await pdfjsLib.getDocument({ data: pdfData }).promise;
+                    let fullText = '';
+                    
+                    for (let i = 1; i <= pdf.numPages; i++) {
+                        const page = await pdf.getPage(i);
+                        const textContent = await page.getTextContent();
+                        
+                        // เพิ่มข้อความที่ดึงได้ และเพิ่มเครื่องหมายแบ่งหน้า
+                        fullText += textContent.items.map(item => item.str).join(' ') + '\n\n--- หน้าที่ ' + (i + 1) + ' ---\n\n';
+                    }
+
+                    newDocContentEl.value = fullText.trim();
+                    saveMessageEl.className = 'success-box';
+                    saveMessageEl.textContent = `แสดงตัวอย่างข้อความ ${formatBytes(fullText.length)} (ใช้ในการประมวลผล) ท่านสามารถแก้ไขก่อนบันทึกได้`;
+                    setUIState(); // เปิดใช้งานปุ่มอีกครั้ง
+
+                } catch (error) {
+                    console.error("PDF Extraction Error:", error);
+                    newDocContentEl.value = '';
+                    saveMessageEl.className = 'error-box';
+                    saveMessageEl.textContent = `ไม่สามารถดึงข้อความจากไฟล์นี้ได้ (Error: ${error.message}). กรุณาแปลงเป็นข้อความด้วย OCR หรือวางด้วยตนเอง`;
+                    setUIState();
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        };
+        // *** API CALLS (Gemini - Simulated) ***
+
+        const askGemini = async (query) => {
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+            const chatBox = document.getElementById('chatBox');
+            const askBtn = document.getElementById('askBtn');
+            const queryInput = document.getElementById('queryInput');
+
+            if (allDocuments.length === 0) {
+                displayMessage("AI Expert", "ไม่พบเอกสารกฎระเบียบในฐานความรู้ กรุณาเพิ่มเอกสารก่อนสอบถาม", false);
+                return;
+            }
+
+            // 1. สร้าง Context จากเอกสารทั้งหมด
+            const { combinedText, titles } = buildContext(allDocuments);
+            const titlesList = titles.join(', ');
+
+            const systemPrompt = `
+                คุณคือ AI ผู้เชี่ยวชาญกฎระเบียบการจ่ายยาของหน่วยงานเภสัชกรรม ข้อมูลที่คุณใช้ถูกจำกัดอยู่แค่ในส่วน "ฐานความรู้" เท่านั้น
+                1. ต้องตอบคำถามโดยอ้างอิง *เฉพาะ* ข้อมูลที่ให้มาในฐานความรู้ ห้ามใช้ความรู้ทั่วไปของโลก
+                2. หากไม่พบข้อมูลที่เกี่ยวข้องในฐานความรู้ ให้ตอบว่า "ไม่พบข้อมูลที่เกี่ยวข้องในเอกสารกฎระเบียบที่ให้มา"
+                3. ต้องระบุชื่อเอกสารที่ใช้ในการอ้างอิงทุกครั้งในคำตอบ ตัวอย่าง: "... (อ้างอิงจาก: [ชื่อเอกสารที่ใช้])"
+                4. ห้ามแต่งข้อมูลขึ้นมาเองเด็ดขาด
+
+                ฐานความรู้ปัจจุบันประกอบด้วยเอกสาร: ${titlesList}
+            `;
+            
+            const userQuery = `
+                โปรดตอบคำถามต่อไปนี้โดยอ้างอิงจากข้อมูลในฐานความรู้เท่านั้น: "${query}"
+            `;
+
+            const payload = {
+                contents: [
+                    { role: "user", parts: [{ text: `BASE KNOWLEDGE:\n${combinedText}\n\nUSER QUERY:\n${userQuery}` }] }
+                ],
+                systemInstruction: { parts: [{ text: systemPrompt }] },
+            };
+
+            // แสดงสถานะ Loading
+            askBtn.disabled = true;
+            askBtn.textContent = 'AI กำลังค้นหา...';
+            displayMessage("User", query, true); // แสดงคำถามผู้ใช้
+            const loadingBubble = displayMessage("AI Expert", "...", false, true); // แสดงจุดโหลด
+
+            try {
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+                const text = result.candidates?.[0]?.content?.parts?.[0]?.text || "ไม่สามารถประมวลผลคำตอบได้";
+                
+                loadingBubble.textContent = text; // แทนที่จุดโหลดด้วยคำตอบจริง
+                loadingBubble.classList.remove('loading-dots'); 
+                
+            } catch (error) {
+                console.error("Gemini API Error:", error);
+                loadingBubble.textContent = "เกิดข้อผิดพลาดในการเชื่อมต่อ AI Expert: โปรดตรวจสอบการเชื่อมต่ออินเทอร์เน็ต";
+                loadingBubble.classList.remove('loading-dots');
+            } finally {
+                askBtn.disabled = false;
+                askBtn.textContent = 'ถาม AI';
+                queryInput.value = '';
+            }
+        };
+
+        const displayMessage = (sender, content, isUser, isLoading = false) => {
+            const chatBox = document.getElementById('chatBox');
+            const bubble = document.createElement('div');
+            
+            // ไม่มีการใช้ loading-dots อีกต่อไป
+            bubble.className = `chat-bubble ${isUser ? 'user-bubble' : 'ai-bubble'}`;
+            
+            const senderSpan = document.createElement('span');
+            senderSpan.className = `font-bold ${isUser ? 'text-white' : 'text-gray-900'} block mb-1`;
+            senderSpan.textContent = isUser ? 'คุณ' : 'AI Expert:';
+            
+            const contentP = document.createElement('p');
+            contentP.textContent = content;
+
+            bubble.appendChild(senderSpan);
+            bubble.appendChild(contentP);
+            chatBox.appendChild(bubble);
+            chatBox.scrollTop = chatBox.scrollHeight;
+            return contentP;
+        };
+
+        // *** ROUTING LOGIC ***
+        const showPage = (pageId) => {
+            document.querySelectorAll('.page-section').forEach(section => {
+                section.style.display = 'none';
+            });
+            const page = document.getElementById(pageId);
+            if (page) {
+                page.style.display = 'block';
+                // เรียก renderDocList เมื่อเข้าสู่หน้า Admin เพื่อให้รายการอัปเดต
+                if (pageId === 'admin-page') {
+                    renderDocList(); 
+                }
+            } else {
+                // Default to user page
+                document.getElementById('user-page').style.display = 'block';
+            }
+        };
+
+        const handleHashChange = () => {
+            const hash = window.location.hash.substring(1); // #admin -> admin
+            if (hash === 'admin') {
+                showPage('admin-page');
+            } else {
+                showPage('user-page');
+            }
+        };
+
+        // *** INIT FUNCTION ***
+        const initApp = () => {
+            // โหลดเอกสารจาก Local Storage
+            allDocuments = loadDocuments();
+            
+            // กำหนด Event Listeners
+            document.getElementById('saveDocumentBtn').addEventListener('click', handleSaveDocument);
+            document.getElementById('newDocTitle').addEventListener('input', setUIState);
+            document.getElementById('newDocContent').addEventListener('input', setUIState);
+            
+            // 3. กำหนด Event Listener สำหรับการอัปโหลดไฟล์
+            document.getElementById('fileInput').addEventListener('change', previewPdfText);
+
+            document.getElementById('queryInput').addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    askGemini(e.target.value);
+                }
+            });
+            document.getElementById('askBtn').addEventListener('click', () => {
+                const query = document.getElementById('queryInput').value;
+                if (query.trim()) {
+                    askGemini(query);
+                }
+            });
+            
+            // Event Listener สำหรับปุ่มลบทั้งหมด (ในหน้า Admin)
+            const deleteAllBtn = document.getElementById('deleteAllBtn');
+            if (deleteAllBtn) {
+                deleteAllBtn.addEventListener('click', deleteAllDocuments);
+            }
+            
+            // Event Listener สำหรับ Import/Export (ในหน้า Admin)
+            document.getElementById('exportBtn').addEventListener('click', exportData);
+            document.getElementById('importFile').addEventListener('change', importData);
+
+            // ตั้งค่าสถานะเริ่มต้น
+            setUIState();
+
+            // กำหนด Routing
+            window.addEventListener('hashchange', handleHashChange);
+            handleHashChange(); // เรียกครั้งแรกเพื่อกำหนดหน้าเริ่มต้น
+        };
+
+        window.onload = initApp; // เรียกใช้งานเมื่อหน้าเว็บโหลดเสร็จ
+        
+        // ฟังก์ชัน Export Data
+        const exportData = () => {
+            try {
+                const dataStr = localStorage.getItem(STORAGE_KEY);
+                if (!dataStr || dataStr === '[]') {
+                    alert('ไม่พบข้อมูลกฎระเบียบที่บันทึกไว้เพื่อส่งออก');
+                    return;
+                }
+                const blob = new Blob([dataStr], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `pharmacy_regulations_export_${new Date().toISOString().slice(0, 10)}.json`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                alert('ส่งออกฐานความรู้สำเร็จ! ไฟล์ JSON ได้ถูกดาวน์โหลดแล้ว');
+            } catch (error) {
+                alert('เกิดข้อผิดพลาดในการส่งออกข้อมูล: ' + error.message);
+            }
+        };
+
+        // ฟังก์ชัน Import Data
+        const importData = (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                try {
+                    const importedDocs = JSON.parse(e.target.result);
+                    if (!Array.isArray(importedDocs) || importedDocs.some(doc => !doc.id || !doc.title || !doc.content)) {
+                        throw new Error("ไฟล์ JSON ไม่ถูกต้อง");
+                    }
+                    
+                    // บันทึกทับข้อมูลเดิม
+                    allDocuments = importedDocs;
+                    if(saveDocuments(allDocuments)) {
+                        renderDocList();
+                        const saveMessageEl = document.getElementById('saveMessage');
+                        saveMessageEl.className = 'success-box';
+                        saveMessageEl.textContent = `นำเข้าฐานความรู้สำเร็จ จำนวน ${importedDocs.length} รายการ`;
+                    }
+                } catch (error) {
+                    alert('เกิดข้อผิดพลาดในการนำเข้าข้อมูล: ' + error.message);
+                }
+            };
+            reader.readAsText(file);
+        };
+        
+    </script>
+</head>
+<body class="p-8 bg-gray-100 min-h-screen">
+    <div class="max-w-6xl mx-auto">
+        <h1 class="text-3xl font-bold text-center text-gray-800 mb-8">AI RAG ผู้เชี่ยวชาญกฎระเบียบ (Offline)</h1>
+
+        <!-- Navigation Placeholder -->
+        <nav class="mb-4 flex justify-center space-x-4">
+            <a href="#user" class="text-blue-600 hover:text-blue-800 font-semibold" onclick="showPage('user-page')">ส่วนผู้ใช้งาน</a>
+            <a href="#admin" class="text-red-600 hover:text-red-800 font-semibold" onclick="showPage('admin-page')">ส่วนผู้ดูแลระบบ</a>
+        </nav>
+        
+        <!-- User Section (Page 1) -->
+        <div id="user-page" class="page-section card p-6 mb-8 border-t-4 border-blue-500">
+            <h2 class="text-2xl font-semibold text-gray-800 mb-4">1. ส่วนผู้ใช้งาน: สอบถามกฎระเบียบ</h2>
+            <div id="chatBox" class="h-80 overflow-y-auto bg-gray-50 p-4 border rounded-lg mb-4 flex flex-col space-y-2">
+                <!-- Chat messages will be appended here -->
+                <div class="chat-bubble ai-bubble">
+                    <span class="font-bold text-gray-900 block mb-1">AI Expert:</span>
+                    <p>สวัสดีครับ! ผมคือผู้เชี่ยวชาญด้านกฎระเบียบการจ่ายยา โปรดพิมพ์คำถามของคุณ (อ้างอิงจากเอกสารที่บันทึกไว้) แล้วกด Enter หรือคลิกปุ่ม 'ถาม AI'</p>
+                </div>
+            </div>
+            
+            <div class="flex space-x-2">
+                <input type="text" id="queryInput" class="flex-1 p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" placeholder="พิมพ์คำถามของคุณ...">
+                <button id="askBtn" class="btn-primary w-24">ถาม AI</button>
+            </div>
+        </div>
+
+        <!-- Admin Section (Page 2) -->
+        <div id="admin-page" class="page-section card p-6 border-t-4 border-red-500">
+            <h2 class="text-2xl font-semibold text-gray-800 mb-4">2. ส่วนผู้ดูแลระบบ: จัดการฐานความรู้ (Local Storage)</h2>
+
+            <!-- Warning Box -->
+            <div class="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 mb-4 rounded-lg" role="alert">
+                <p class="font-bold">คำเตือนสำคัญ (โหมด Offline)</p>
+                <p class="text-sm">ข้อมูลนี้ถูกจัดเก็บไว้ใน Local Storage ของเบราว์เซอร์บน **เครื่องนี้เท่านั้น** ห้ามล้างข้อมูลเว็บไซต์ (Clear browsing data) มิฉะนั้นข้อมูลกฎระเบียบทั้งหมดจะถูกลบถาวร</p>
+            </div>
+
+            <!-- Import/Export -->
+            <div class="mb-6 flex space-x-4">
+                <button id="exportBtn" class="btn-secondary flex-1">
+                    ส่งออกฐานความรู้ (.json)
+                </button>
+                <label for="importFile" class="btn-secondary flex-1 text-center cursor-pointer">
+                    นำเข้าฐานความรู้ (.json)
+                </label>
+                <input type="file" id="importFile" accept=".json" class="hidden" onchange="importData(event)">
+            </div>
+            
+            <!-- Manual Text Input -->
+            <h3 class="text-xl font-semibold mb-3">วางข้อความด้วยตนเอง หรืออัปโหลดไฟล์เพื่อดูตัวอย่าง</h3>
+            <input type="text" id="newDocTitle" class="w-full p-2 border border-gray-300 rounded-lg mb-3" placeholder="ชื่อเอกสาร (เช่น คู่มือจ่ายยา ฉบับปี 2567)">
+            <textarea id="newDocContent" class="w-full p-2 border border-gray-300 rounded-lg h-32 resize-y" placeholder="วางข้อความจากไฟล์ PDF หรือข้อความที่ท่านวาง..."></textarea>
+            
+            <div class="flex justify-between items-center mt-3">
+                <button id="saveDocumentBtn" class="btn-primary" disabled>บันทึกเอกสารใหม่</button>
+                <p id="saveMessage" class="text-sm text-gray-600"></p>
+            </div>
+
+            <!-- Upload (Enabled for Preview) -->
+            <div class="mt-6 border-t pt-4">
+                <h3 class="text-xl font-semibold mb-3">อัปโหลดไฟล์ PDF (เพื่อดูตัวอย่างเท่านั้น)</h3>
+                <input type="file" id="fileInput" class="w-full p-2 border border-gray-300 rounded-lg bg-white" multiple onchange="previewPdfText(event)">
+            </div>
+            
+            <!-- Document List -->
+            <div class="mt-6 pt-4 border-t">
+                <div class="flex justify-between items-center mb-3">
+                    <h3 class="text-xl font-semibold text-gray-700">ฐานความรู้ทั้งหมดที่ AI ใช้ตอบคำถาม (<span id="docCount">0</span> เอกสาร)</h3>
+                    <button id="deleteAllBtn" class="text-sm text-red-600 hover:text-red-800 font-semibold" onclick="deleteAllDocuments()">[ลบทั้งหมด]</button>
+                </div>
+
+                <div id="docListContainer" class="border rounded-lg overflow-hidden">
+                    <!-- Document items will be injected here by renderDocList -->
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
